@@ -5,11 +5,11 @@ __pycache__/
 .venv/
 venv/
 
-# 运行时数据（磁盘即数据库，不上传）
+# runtime data (disk-as-db, not for git)
 data/
 data_backup_*/
 
-# 临时分析产物
+# temp analysis artifacts
 drift_*.png
 *.tmp
 

@@ -1,5 +1,5 @@
-# docRenderCut 依赖（锁定到已验证可运行的版本）
-# 推荐 Python 3.10 ~ 3.13
+# docRenderCut dependencies (pinned to verified versions)
+# Recommended Python 3.10 - 3.13
 numpy==2.5.3
 opencv-python-headless==5.0.0.93
 pymupdf==1.28.2
