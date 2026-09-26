@@ -1,0 +1,232 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>docRenderCut · 单据标准模板渲染与块裁剪</title>
+<link rel="icon" href="data:,">
+<link rel="stylesheet" href="/style.css">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="brand">docRenderCut<small>单据标准模板渲染与模板块裁剪</small></div>
+  <div class="grow"></div>
+  <span id="health" class="chip">检查服务…</span>
+</header>
+
+<div class="layout">
+  <aside class="sidebar">
+    <div class="side-head">
+      <button id="btnNewCat" class="primary">+ 创建分类</button>
+    </div>
+    <div class="side-search"><input id="catSearch" placeholder="筛选分类…"></div>
+    <ul id="catList" class="cat-list"></ul>
+    <div class="side-foot"><span id="catCount" class="dim"></span></div>
+  </aside>
+
+  <main class="main">
+    <div id="empty" class="empty">
+      <h2>先创建一个分类</h2>
+      <p>分类是单据类型的容器（如「支票」），分类下再维护不同银行/版本的<b>模板</b>。
+         每个模板带自己的纸面参数（DPI、画布、纸张处理）和坐标清单。
+         上传时只要选「分类」，系统会按页自动识别每页属于分类下的哪个模板。</p>
+      <button class="primary" onclick="document.getElementById('btnNewCat').click()">创建分类</button>
+    </div>
+
+    <div id="catView" class="cat-view" hidden>
+      <div class="cat-head">
+        <div>
+          <h2 id="catName">—</h2>
+          <div class="cat-meta" id="catMeta"></div>
+        </div>
+        <div class="grow"></div>
+        <button id="btnNewTpl" class="ghost">+ 新建模板</button>
+        <button id="btnDelCat" class="danger ghost">删除分类</button>
+      </div>
+
+      <div id="catWarn" class="warn" hidden></div>
+
+      <!-- 模板选择条：分类下的模板列表 -->
+      <div class="tpl-strip" id="tplStrip" hidden>
+        <span class="lbl">模板：</span>
+        <div id="tplChips" class="tpl-chips"></div>
+      </div>
+
+      <nav class="tabs">
+        <button class="tab active" data-tab="tpl">模板与坐标</button>
+        <button class="tab" data-tab="batch">批量处理</button>
+        <button class="tab" data-tab="jobs">任务记录</button>
+      </nav>
+
+      <!-- ============ 模板与坐标 ============ -->
+      <section class="tabpane active" data-pane="tpl">
+        <div class="split">
+          <div class="pane-left">
+            <div class="toolbar">
+              <span class="lbl">缩放</span>
+              <input id="zoom" type="range" min="0.1" max="3" step="0.05" value="0.4">
+              <span id="zoomVal" class="mono">0.40x</span>
+              <button id="btnFit" class="ghost sm">适应宽度</button>
+              <label class="ck"><input id="ckLines" type="checkbox"> 显示检测到的表格线</label>
+              <label class="ck"><input id="ckSnap" type="checkbox" checked> 吸附表格线</label>
+              <label class="ck" title="默认只显示选中的那个框；勾上可一次看全部">
+                <input id="ckShowAll" type="checkbox"> 全部显示</label>
+              <a id="linkFullTpl" class="btn-like sm" target="_blank" hidden>看原图</a>
+            </div>
+            <div class="canvas-wrap" id="canvasWrap">
+              <canvas id="tplCanvas"></canvas>
+            </div>
+            <div class="hint">
+              在模板图上<b>拖出一个新框</b>；点击右下列表里的某一项即<b>选中并显示它的框</b>（默认不显示全部框，
+              需要时勾选工具栏「全部显示」）。选中后：拖框内部<b>移动坐标</b>，拖框边上的 8 个方块<b>改宽高</b>，
+              方向键 ±1px、Shift+方向键 ±10px 微调。右侧数字与框是双向联动的。
+              <span id="tplSizeHint" class="dim"></span>
+            </div>
+          </div>
+
+          <div class="pane-right">
+            <h3>模板块坐标</h3>
+            <div class="form">
+              <label>字段名称 <span class="req">*</span>
+                <input id="inId" placeholder="如 amount_fig / 小写金额"></label>
+              <div class="row4">
+                <label>X<input id="inX" type="number" step="1"></label>
+                <label>Y<input id="inY" type="number" step="1"></label>
+                <label>W<input id="inW" type="number" step="1"></label>
+                <label>H<input id="inH" type="number" step="1"></label>
+              </div>
+              <label>外扩像素 <span class="dim">（吸收配准残差，实际裁剪框 = 上面坐标外扩这么多）</span>
+                <input id="inMargin" type="number" step="1" value="8"></label>
+              <label>备注<input id="inNote" placeholder="可选"></label>
+              <div class="btn-row">
+                <button id="btnAddCrop" class="primary">保存该块</button>
+                <button id="btnClearSel" class="ghost">取消选择</button>
+              </div>
+              <div id="editStatus" class="edit-status"></div>
+            </div>
+
+            <div class="crop-list-head">
+              <span>已配置 <b id="cropCount">0</b> 块</span>
+              <button id="btnReloadCrops" class="ghost sm">刷新</button>
+            </div>
+            <div id="cropList" class="crop-list"></div>
+          </div>
+        </div>
+      </section>
+
+      <!-- ============ 批量处理 ============ -->
+      <section class="tabpane" data-pane="batch">
+        <div class="card">
+          <h3>上传批量生产文件</h3>
+          <p id="batchScope" class="scope"></p>
+          <p class="dim">上传时只需选「分类」：PDF 自动分页，系统按页<b>自动识别</b>每页属于分类下哪个模板，
+            然后按各自模板的规格渲染、按各自坐标裁块；识别不出的页进「拒收」列表供审计。</p>
+          <input id="batchFiles" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp">
+          <div class="btn-row">
+            <button id="btnRunBatch" class="primary">上传并处理</button>
+            <button id="btnVerify" class="ghost" disabled>运行块验证</button>
+          </div>
+          <div id="progressWrap" class="progress-wrap" hidden>
+            <div class="progress"><div id="progressBar"></div></div>
+            <div id="progressText" class="dim"></div>
+          </div>
+        </div>
+        <div id="jobResult"></div>
+      </section>
+
+      <!-- ============ 任务记录 ============ -->
+      <section class="tabpane" data-pane="jobs">
+        <p id="jobsScope" class="scope"></p>
+        <div id="jobsList" class="jobs-list"></div>
+      </section>
+    </div>
+  </main>
+</div>
+
+<!-- ============ 创建分类弹窗 ============ -->
+<div id="modalCreate" class="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3>创建分类</h3>
+      <button class="x" data-close>×</button>
+    </div>
+    <div class="modal-body" id="createBody">
+      <label>分类名称 <span class="req">*</span>
+        <input id="fName" placeholder="如 支票 / 付款申请单"></label>
+      <p class="dim sm">分类是纯容器，不带纸面参数。建好分类后，再在分类下建具体模板（银行/版本）。</p>
+      <div id="createMsg" class="msg" hidden></div>
+    </div>
+    <div class="modal-foot" id="createFoot">
+      <button class="ghost" data-close>取消</button>
+      <button id="btnDoCreate" class="primary">创建分类</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 创建模板弹窗 ============ -->
+<div id="modalTpl" class="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3>创建模板</h3>
+      <button class="x" data-close>×</button>
+    </div>
+    <div class="modal-body" id="tplBody">
+      <label>模板名称 <span class="req">*</span>
+        <input id="tfName" placeholder="如 汇丰A版 / 恒生B版"></label>
+      <p class="dim sm">模板 ID 由后台自动生成（形如 TPL20260925-0001）。</p>
+
+      <div class="grid3">
+        <label>DPI<input id="tfDpi" type="number" value="200" min="50" max="1200"></label>
+        <label>画布宽 W<input id="tfW" type="number" value="1600"></label>
+        <label>画布高 H<input id="tfH" type="number" value="3400"></label>
+      </div>
+      <p class="dim sm" id="tfSizeHint">画布 = 宽×高 像素 @ DPI。上传样张后会核对宽高比。</p>
+
+      <label>样张（单页：矢量 PDF / 扫描件 / 图片）
+        <input id="tfSample" type="file" accept=".pdf,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp"></label>
+
+      <details class="adv">
+        <summary>高级选项（拍照件、有底纹的票据需要）</summary>
+        <label>纸张处理
+          <select id="tfPaper">
+            <option value="off">整页样张（扫描件 / 矢量 PDF，推荐）</option>
+            <option value="auto">自动检测纸张四角（复杂背景不可靠）</option>
+            <option value="corners">手工指定四角</option>
+          </select></label>
+        <label id="tfCornersRow" hidden>四角 x1,y1,x2,y2,x3,y3,x4,y4（左上,右上,右下,左下）
+          <input id="tfCorners" placeholder="23,42,1166,38,1168,412,30,472"></label>
+        <div class="grid2">
+          <label>深墨偏置（建模板）<input id="tfInkBias" type="number" value="0" min="0" max="120"></label>
+          <label>深墨偏置（输出二值化）<input id="tfInkDark" type="number" value="25" min="0" max="120"></label>
+        </div>
+        <p class="dim sm">有防伪底纹或深色背景时，深墨偏置 20~40 可把底纹排掉。</p>
+      </details>
+
+      <div id="tplMsg" class="msg" hidden></div>
+    </div>
+    <div class="modal-foot" id="tplFoot">
+      <button class="ghost" data-close>取消</button>
+      <button id="btnDoCreateTpl" class="primary">上传并构建模板</button>
+      <button id="btnPreviewTpl" class="primary" hidden>模板预览</button>
+      <button id="btnFinishTpl" class="primary" hidden>关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 大图预览 ============ -->
+<div id="lightbox" class="modal light" hidden>
+  <div class="light-box">
+    <div class="modal-head">
+      <h3 id="lbTitle">预览</h3>
+      <button class="x" data-close>×</button>
+    </div>
+    <div class="light-body"><img id="lbImg" alt=""></div>
+    <div class="modal-foot"><a id="lbOpen" class="ghost btn-like" target="_blank">新窗口打开</a>
+      <button class="primary" data-close>关闭</button></div>
+  </div>
+</div>
+
+<script src="/app.js"></script>
+</body>
+</html>
