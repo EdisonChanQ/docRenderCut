@@ -21,6 +21,7 @@ from .rectify import (
 from .render import (
     RenderRecord,
     render_to_canvas,
+    write_page_pdf,
     write_png,
     write_report,
     write_sidecar,
@@ -192,24 +193,33 @@ class Engine:
         前端需要看到进度，而不是一个长时间的空白等待。
         """
         out_root = Path(out_dir)
-        std_dir = out_root / "standardized"
+        # 标准图放 standardized/image/；同目录下 standardized/pdf/ 存原始分页（每页一个单页 PDF）
+        std_dir = out_root / "standardized" / "image"
+        pdf_dir = out_root / "standardized" / "pdf"
         side_dir = out_root / "sidecar"
         rej_dir = Path(rejected_dir) if rejected_dir else out_root / "rejected"
         records: list[RenderRecord] = []
         crop_manifest: list[dict] = []
 
         for unit in units:
+            stem = f"{Path(unit.source).stem}_p{unit.page_index + 1:04d}"
+            # 原始分页先落盘（配准前的原始页），供消费者查看
+            page_pdf = pdf_dir / f"{stem}.pdf"
+            write_page_pdf(page_pdf, unit.image,
+                           int(unit.meta.get("render_dpi") or unit.declared_dpi
+                               or self.render_dpi))
+
             rec, img = self.process_unit(unit)
 
             if rec.status in ("ok", "low_confidence") and img is not None:
-                stem = f"{Path(unit.source).stem}_p{unit.page_index + 1:04d}"
-                out_path = (std_dir if rec.status == "ok" else out_root / "low_confidence") \
-                    / f"{stem}.png"
+                out_path = (std_dir if rec.status == "ok"
+                            else out_root / "low_confidence") / f"{stem}.png"
                 # 同一页只应存在于一个目录。重跑时状态可能变化（ok <-> low_confidence），
                 # 不清旧文件就会同一页同时躺在 standardized/ 和 low_confidence/ 里，
                 # 下游会拿到过期的那一份——而且它看起来完全正常。实测因此让
                 # verify 报出重复行，还差点把两个不同版本当成两张不同的输入图。
-                _drop_stale(stem, [std_dir, out_root / "low_confidence", rej_dir])
+                _drop_stale(stem, [out_root / "standardized", std_dir,
+                                   out_root / "low_confidence", rej_dir])
                 write_png(out_path, img, self.template.dpi)
                 rec.output = str(out_path)
                 write_sidecar(side_dir / f"{stem}.json", rec)
@@ -222,13 +232,15 @@ class Engine:
                                            dpi=self.template.dpi)
                     crop_manifest.append({
                         "source": stem, "status": rec.status,
-                        "standardized": str(out_path), "blocks": written,
+                        "standardized": str(out_path),
+                        "original_pdf": str(page_pdf),
+                        "blocks": written,
                         "diagnostics": diag,
                     })
             else:
-                stem = f"{Path(unit.source).stem}_p{unit.page_index + 1:04d}"
                 # 拒收页也原样落盘 + 记录，便于人工复核，绝不静默丢弃
-                _drop_stale(stem, [std_dir, out_root / "low_confidence", rej_dir])
+                _drop_stale(stem, [out_root / "standardized", std_dir,
+                                   out_root / "low_confidence", rej_dir])
                 write_png(rej_dir / f"{stem}.png", unit.image, self.render_dpi)
                 rec.output = str(rej_dir / f"{stem}.png")
                 write_sidecar(side_dir / f"{stem}.json", rec)

@@ -3,14 +3,20 @@
  * 拖手柄改宽高 / 数字输入联动 / 保存落到后端。
  *
  * 运行： NODE_PATH=<playwright-core 所在 node_modules> node tools/test_annotator.js
+ *   可选环境变量：
+ *     BASE  服务地址，默认 http://127.0.0.1:8848
+ *     CAT   分类 ID；**不传就自动用列表里第一个分类**（分类是用户建的，写死会过期）
+ *     CHROME 浏览器可执行文件；不传则自动探测（见 tools/find_chrome.js）
+ *
+ * 注意：这个测试会**改动真实坐标数据**（拖动/改宽高后保存），
+ * 所以它把原始值记下来、结束前（含异常路径）自动还回去。别去掉这个还原步骤。
  */
 const path = require('path');
 const { chromium } = require('playwright-core');
+const { resolveChrome } = require('./find_chrome');
 
 const BASE = process.env.BASE || 'http://127.0.0.1:8848';
-const CAT = process.env.CAT || 'CAT20260925-0001';
-const CHROME = process.env.CHROME
-  || 'C:\\Users\\Administrator\\.agent-browser\\browsers\\chrome-154.0.8037.57\\chrome.exe';
+const CAT = process.env.CAT || '';        // 空 = 自动取第一个分类
 
 const results = [];
 function check(name, ok, detail) {
@@ -18,14 +24,20 @@ function check(name, ok, detail) {
   console.log(`${ok ? '  PASS' : '  FAIL'}  ${name}${detail ? '  —— ' + detail : ''}`);
 }
 
+// 数据还原钩子：测试中途异常退出也会执行，避免把被测数据留在半路状态
+let restoreOriginal = async () => {};
+
 (async () => {
-  const browser = await chromium.launch({ executablePath: CHROME, headless: true });
+  let chromeExe;
+  try { chromeExe = resolveChrome(); }
+  catch (e) { console.error(e.message); process.exit(2); }
+  const browser = await chromium.launch({ executablePath: chromeExe, headless: true });
   const page = await browser.newPage({ viewport: { width: 1680, height: 950 } });
   const errors = [];
   page.on('pageerror', (e) => errors.push(String(e)));
   page.on('console', (m) => { if (m.type() === 'error') errors.push(m.text()); });
 
-  await page.goto(`${BASE}/?cat=${CAT}`, { waitUntil: 'load' });
+  await page.goto(CAT ? `${BASE}/?cat=${CAT}` : BASE, { waitUntil: 'load' });
   // 等模板真正就绪。
   // 注意不能用「canvas.width > 100」判——加载提示也会把 canvas 设成 460x90，
   // 那个条件会提前通过。要判 state.tpl 是否已赋值。
@@ -64,8 +76,38 @@ function check(name, ok, detail) {
 
   console.log('\n[2] 点击清单项 → 显示对应框');
   const first = (await page.$$('#cropList .crop-item'))[0];
+  if (!first) {
+    console.error('该分类的第一个模板下没有任何坐标块——请先建模板并框几个块再跑这个测试。');
+    await browser.close();
+    process.exit(2);
+  }
   const firstName = await first.getAttribute('data-id');
+  // 记下原始值，测试结束（含异常）时还回去
+  const origItem = await page.evaluate((id) => {
+    const it = (state.crops.items || []).find((x) => x.id === id);
+    return it ? { id: it.id, name: it.name || '', roi: [...it.roi],
+                  safe_margin: it.safe_margin || 0 } : null;
+  }, firstName);
+  restoreOriginal = async () => {
+    if (!origItem) return false;
+    const okBack = await page.evaluate(async (it) => {
+      const r = await fetch(
+        `/api/categories/${state.cat.id}/templates/${state.tpl.id}/crops`, {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/json' },
+          body: JSON.stringify(it),
+        });
+      const d = await r.json();
+      const back = (d.items || []).find((x) => x.id === it.id);
+      return !!back && JSON.stringify(back.roi) === JSON.stringify(it.roi);
+    }, origItem);
+    return okBack;
+  };
   await first.click();
+  // Canvas 拖动类断言必须在每个鼠标动作之间留一点时间：一次 down/move/up 之间
+  // 页面要跑完 selectCrop → draw()（draw 会重设 canvas.width 重绘画布）。
+  // 不留时间会出现"事件发了但画布还没就绪"，表现为"拖动完全没反应"的假失败。
+  await page.waitForTimeout(200);
   s = await S();
   check('点清单后选中了该项', s.hasEdit && s.id === firstName, `选中 ${s.id}`);
   check('表单已同步坐标', s.formX === String(s.roi[0]), `X=${s.formX} roi=${s.roi}`);
@@ -76,9 +118,13 @@ function check(name, ok, detail) {
   const box = await imgToClient(roiBefore[0] + roiBefore[2] / 2, roiBefore[1] + roiBefore[3] / 2);
   box.before = roiBefore;
   await page.mouse.move(box.x, box.y);
+  await page.waitForTimeout(60);
   await page.mouse.down();
+  await page.waitForTimeout(60);
   await page.mouse.move(box.x + 60, box.y + 30, { steps: 8 });
+  await page.waitForTimeout(60);
   await page.mouse.up();
+  await page.waitForTimeout(80);
   s = await S();
   check('拖动后坐标变化', s.roi[0] !== box.before[0] || s.roi[1] !== box.before[1],
     `${box.before} -> ${s.roi}`);
@@ -88,16 +134,27 @@ function check(name, ok, detail) {
 
   console.log('\n[4] 拖右下角手柄 → 改宽高');
   const roiForHandle = await page.evaluate(() => [...state.edit.roi]);
+  // 位移必须按**图像像素**算再换算到屏幕：屏幕增量在低缩放下会放大成很大的图像增量
+  // （zoom 0.27 时 -80 屏幕 px ≈ -296 图像 px），一旦超过框高，拖过头就会被应用
+  // 正确地"翻转归一化"，断言就会误判成失败。这里按比例缩小 20%，对任何框都成立。
+  const shrink = (v) => Math.max(6, Math.min(Math.round(v * 0.2), v - 6));
+  const dw = shrink(roiForHandle[2]);
+  const dh = shrink(roiForHandle[3]);
   const hnd = await imgToClient(roiForHandle[0] + roiForHandle[2], roiForHandle[1] + roiForHandle[3]);
+  const hndTo = await imgToClient(roiForHandle[0] + roiForHandle[2] - dw,
+                                  roiForHandle[1] + roiForHandle[3] - dh);
   hnd.before = roiForHandle;
   await page.mouse.move(hnd.x, hnd.y);
+  await page.waitForTimeout(60);
   await page.mouse.down();
-  // 往左上收：这一个框的右边已经贴住画布右边界，往右拖会被边界正确截住（另有专门用例）
-  await page.mouse.move(hnd.x - 80, hnd.y + 50, { steps: 8 });
+  await page.waitForTimeout(60);
+  await page.mouse.move(hndTo.x, hndTo.y, { steps: 8 });
+  await page.waitForTimeout(60);
   await page.mouse.up();
+  await page.waitForTimeout(80);
   s = await S();
-  check('拖手柄后宽变小、高变大', s.roi[2] < hnd.before[2] && s.roi[3] > hnd.before[3],
-    `${hnd.before} -> ${s.roi}`);
+  check('拖手柄后宽高都变小', s.roi[2] < hnd.before[2] && s.roi[3] < hnd.before[3],
+    `${hnd.before} -> ${s.roi} (收 ${dw}x${dh} 图像px)`);
   check('拖手柄不移动左上角', s.roi[0] === hnd.before[0] && s.roi[1] === hnd.before[1],
     `x=${s.roi[0]} y=${s.roi[1]}`);
 
@@ -105,9 +162,13 @@ function check(name, ok, detail) {
   const roi4b = await page.evaluate(() => [...state.edit.roi]);
   const h4b = await imgToClient(roi4b[0] + roi4b[2], roi4b[1] + roi4b[3]);
   await page.mouse.move(h4b.x, h4b.y);
+  await page.waitForTimeout(60);
   await page.mouse.down();
+  await page.waitForTimeout(60);
   await page.mouse.move(h4b.x + 400, h4b.y + 20, { steps: 10 });
+  await page.waitForTimeout(60);
   await page.mouse.up();
+  await page.waitForTimeout(80);
   const r4b = await page.evaluate(() => [...state.edit.roi]);
   check('左上角没被推走', r4b[0] === roi4b[0] && r4b[1] === roi4b[1],
     `${roi4b} -> ${r4b}`);
@@ -159,12 +220,12 @@ function check(name, ok, detail) {
   check('保存后坐标保持', JSON.stringify(s.roi) === JSON.stringify(saved),
     `${saved} vs ${s.roi}`);
   const api = await page.evaluate(async (id) => {
-    const r = await fetch(`/api/categories/${state.cat.id}/crops`);
+    const r = await fetch(`/api/categories/${state.cat.id}/templates/${state.tpl.id}/crops`);
     const d = await r.json();
-    return d.items.find((x) => x.id === id);
+    return (d.items || []).find((x) => x.id === id);
   }, firstName);
-  check('后端已持久化新坐标', JSON.stringify(api.roi) === JSON.stringify(saved),
-    `后端 ${api.roi}`);
+  check('后端已持久化新坐标', api && JSON.stringify(api.roi) === JSON.stringify(saved),
+    `后端 ${api && api.roi}`);
 
   console.log('\n[9] 点空白处不会留下垃圾框');
   // 找一块确定没有任何框的空白：画布右下角留出足够距离
@@ -174,7 +235,12 @@ function check(name, ok, detail) {
   const after = await page.evaluate(() => (state.edit ? state.edit.roi : null));
   check('点击空白清除选择或留下有效框', after === null, `edit=${JSON.stringify(after)}`);
 
-  console.log('\n[10] 控制台无报错');
+  console.log('\n[10] 还原测试前的坐标（本测试会改真实数据，必须还原）');
+  const backOk = await restoreOriginal();
+  check('坐标已还原为测试前的值', backOk === true,
+    `${JSON.stringify(origItem && origItem.roi)}`);
+
+  console.log('\n[11] 控制台无报错');
   check('无 JS 运行时错误', errors.length === 0, errors.slice(0, 3).join(' | '));
 
   await page.screenshot({ path: path.join(__dirname, '_annotator_test.png') });
@@ -183,4 +249,9 @@ function check(name, ok, detail) {
   const failed = results.filter((r) => !r.ok);
   console.log(`\n结果: ${results.length - failed.length}/${results.length} 通过`);
   process.exit(failed.length ? 1 : 0);
-})().catch((e) => { console.error('测试异常:', e); process.exit(2); });
+})().catch(async (e) => {
+  console.error('测试异常:', e);
+  // 异常路径也要还原，否则被测坐标会停在半路状态
+  try { await restoreOriginal(); } catch (e2) { /* 尽力而为 */ }
+  process.exit(2);
+});

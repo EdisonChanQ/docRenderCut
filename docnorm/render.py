@@ -29,6 +29,59 @@ def write_png(path: Path, img: np.ndarray, dpi: int, *,
     )
 
 
+def _is_gray_bgr(bgr: np.ndarray) -> bool:
+    """三通道完全相同即等价于灰度（扫描件绝大多数如此）。"""
+    if bgr.ndim == 2:
+        return True
+    c0 = bgr[:, :, 0]
+    return bool((c0 == bgr[:, :, 1]).all() and (c0 == bgr[:, :, 2]).all())
+
+
+def write_page_pdf(path: Path, img: np.ndarray, dpi: int, *,
+                   force_gray: bool = False) -> None:
+    """把一页**原始位图**写成单页 PDF（无损），供消费者查看原始分页。
+
+    输出目录里每页一个文件（`standardized/pdf/<页>.pdf`），便于在 PDF 阅读器里
+    逐页翻看，且物理尺寸与原始页一致（页面 = 像素数 ÷ dpi）。
+
+    编码选择的实测依据（300dpi A4 ≈ 2481×3510）：
+    - Pillow 存 PDF 对 L / RGB 都走 **JPEG**（实测回读最大像素差 25）→ 有损，不用；
+    - PyMuPDF 存原始位图默认**不压缩**（24.9 MB/页，大小等于裸位图）→ 必须加 deflate；
+    - 加 `deflate=True` 后实测**逐像素完全一致（最大差 0）**，代价是体积：
+
+      | 编码 | 数字票（干净） | 真实扫描件（带噪） |
+      |---|---|---|
+      | DeviceGray | 0.68 MB | 2.16 MB |
+      | DeviceRGB | 1.27 MB | 3.64 MB |
+
+    真实扫描件常带**轻微色偏**（实测通道差最大 19，肉眼看仍是黑白件），
+    色偏不含信息却让体积多花约 70%。所以给 `force_gray` 开关：
+    打开则强制灰度（仍是无损 Flate，只去掉色偏），默认关闭以忠实原样。
+    """
+    import pymupdf
+
+    path.parent.mkdir(parents=True, exist_ok=True)
+    h, w = img.shape[:2]
+
+    if img.ndim == 2 or force_gray or _is_gray_bgr(img):
+        arr = np.ascontiguousarray(
+            img if img.ndim == 2 else cv2.cvtColor(img, cv2.COLOR_BGR2GRAY))
+        colorspace = pymupdf.csGRAY
+    else:
+        arr = np.ascontiguousarray(cv2.cvtColor(img, cv2.COLOR_BGR2RGB))
+        colorspace = pymupdf.csRGB
+
+    doc = pymupdf.open()
+    try:
+        page = doc.new_page(width=w * 72.0 / dpi, height=h * 72.0 / dpi)
+        pix = pymupdf.Pixmap(colorspace, pymupdf.IRect(0, 0, w, h), False)
+        pix.samples_mv[:] = arr.tobytes()
+        page.insert_image(page.rect, pixmap=pix)
+        doc.save(str(path), deflate=True, garbage=3)
+    finally:
+        doc.close()
+
+
 def render_to_canvas(page_bgr: np.ndarray, matrix: np.ndarray,
                      canvas: tuple[int, int], *, prefilter: bool = True) -> np.ndarray:
     """把页面按 matrix（样本坐标 -> 画布坐标）渲染到标准画布。

@@ -12,13 +12,15 @@
 
 from __future__ import annotations
 
+import os
 import shutil
+import tempfile
 from pathlib import Path
 
 import cv2
 import numpy as np
 from fastapi import Body, FastAPI, File, Form, HTTPException, Query, UploadFile
-from fastapi.responses import FileResponse, Response
+from fastapi.responses import FileResponse, JSONResponse, Response
 from fastapi.staticfiles import StaticFiles
 
 from . import service, store
@@ -32,12 +34,89 @@ def _clean_name(name: str) -> str:
     return Path(name.replace("\\", "/")).name or "upload.bin"
 
 
-# ---------------------------------------------------------------- 分类（纯容器）
+# ---------------------------------------------------------------- 初始化门禁
+
+
+_DATA_PREFIXES = ("/api/categories", "/api/jobs", "/files")
+
+
+@app.middleware("http")
+async def _require_data_dir(request, call_next):
+    """未配置数据目录时，所有数据相关接口一律拒绝。
+
+    只在前端把界面藏起来是不够的——直接调 API 也能写数据，
+    那就会在"没配置"的状态下产生一堆没有归属的文件。
+    """
+    if not store.is_configured():
+        p = request.url.path
+        if any(p.startswith(pref) for pref in _DATA_PREFIXES):
+            return JSONResponse(
+                {"detail": "尚未配置数据目录，请先完成初始化（配置并校验数据目录）"},
+                status_code=409)
+    return await call_next(request)
 
 
 @app.get("/api/health")
 def health() -> dict:
-    return {"ok": True, "root": str(store.ROOT)}
+    cfg = service.job_config()
+    return {
+        "ok": True,
+        "root": str(store.ROOT),
+        "configured": store.is_configured(),
+        "data": str(store.data_root()) if store.is_configured() else None,
+        "data_source": store.DATA_SOURCE,
+        # 任务并行与资源预算（运维要能看到"这个实例实际会用多少资源"）
+        "job": cfg.as_dict(),
+        "cpu_cores": os.cpu_count(),
+    }
+
+
+# ---------------------------------------------------------------- 数据目录配置
+
+
+@app.get("/api/setup/state")
+def setup_state() -> dict:
+    """前端启动时先问这个：要不要走初始化流程。"""
+    configured = store.is_configured()
+    stats = None
+    if configured:
+        try:
+            stats = store._count_existing(store.data_root())
+        except OSError:
+            stats = None
+    return {
+        "configured": configured,
+        "data_dir": str(store.data_root()) if configured else None,
+        "data_source": store.DATA_SOURCE,
+        "has_override": store.has_override(),   # 来自 CLI/环境变量，前端改不动
+        "suggested": str(store.suggested_data_dir()),
+        "config_path": str(store.config_path()),
+        "project_root": str(store.ROOT),
+        "stats": stats,
+    }
+
+
+@app.post("/api/setup/probe")
+def setup_probe(payload: dict = Body(...)) -> dict:
+    """探测校验一个候选数据目录（无副作用，只写一个随即删除的探测文件）。"""
+    return store.probe_data_dir(str(payload.get("path", "")))
+
+
+@app.post("/api/setup/configure")
+def setup_configure(payload: dict = Body(...)) -> dict:
+    """校验通过后真正启用：写配置 + 运行时切换数据目录。"""
+    if store.has_override():
+        raise HTTPException(
+            409, "数据目录由命令行参数或环境变量指定（--data / DOCRENDERCUT_DATA），"
+                 "界面无法修改；请改用启动参数。")
+    path = str(payload.get("path", "")).strip()
+    rep = store.probe_data_dir(path)
+    if not rep.get("ok"):
+        raise HTTPException(400, "校验未通过：" + "；".join(rep.get("errors") or ["未知错误"]))
+    target = store.set_data_root(rep["path"])
+    store.save_config({"data_dir": str(target)})
+    return {"ok": True, "data_dir": str(target), "warnings": rep.get("warnings", []),
+            "existing": rep.get("existing")}
 
 
 @app.get("/api/categories")
@@ -74,8 +153,8 @@ def get_category(cid: str) -> dict:
 
 @app.delete("/api/categories/{cid}")
 def delete_category(cid: str) -> dict:
-    store.delete_category(cid)
-    return {"ok": True, "id": cid}
+    cleanup = store.delete_category(cid)
+    return {"ok": True, "id": cid, "cleanup": cleanup}
 
 
 # ---------------------------------------------------------------- 模板（纸面参数）
@@ -93,6 +172,7 @@ async def create_template(
     ink_bias: int = Form(0),
     ink_dark_bias: int = Form(25),
     mono: bool = Form(True),
+    deskew: bool = Form(True),
     sample: UploadFile = File(...),
 ) -> dict:
     """建模板：上传样张 + 参数 -> 后台按参数渲染出该模板标准模板。"""
@@ -117,7 +197,7 @@ async def create_template(
         if len(cs) != 8:
             raise HTTPException(400, "四角需要 8 个数：x1,y1,x2,y2,x3,y3,x4,y4")
 
-    tid = store.new_template_id()
+    tid = store.new_template_id(cid)
     tdir = store.tpl_dir(cid, tid)
     sdir = tdir / "sample"
     sdir.mkdir(parents=True, exist_ok=True)
@@ -138,6 +218,7 @@ async def create_template(
         "ink_bias": int(ink_bias),
         "ink_dark_bias": int(ink_dark_bias),
         "mono": bool(mono),
+        "deskew": bool(deskew),
         "sample": {"filename": fname},
         "created_at": store._now(),
     }
@@ -147,7 +228,8 @@ async def create_template(
         res = service.build_template(cid, tid, dst, dpi=int(dpi),
                                      canvas=(int(width), int(height)),
                                      paper_mode=paper_mode, corners=cs,
-                                     ink_bias=int(ink_bias))
+                                     ink_bias=int(ink_bias),
+                                     deskew_sample=bool(deskew))
     except Exception as exc:  # noqa: BLE001
         store.delete_template(cid, tid)
         raise HTTPException(400, f"模板构建失败：{exc}") from exc
@@ -162,6 +244,34 @@ async def create_template(
     out["template_ready"] = True
     out["n_blocks"] = 0
     return out
+
+
+@app.post("/api/categories/{cid}/templates/probe")
+async def probe_template(cid: str, sample: UploadFile = File(...),
+                         dpi_hint: int = Form(200)) -> dict:
+    """**只识别样张尺寸、不落盘**（建模板的第一步）。
+
+    上传的文件写到系统临时目录、解析完即删，数据目录里不会留下任何中间态。
+    返回检测到的 DPI / 物理尺寸 / 建议画布，供用户在弹窗里核对修改；
+    用户点「确认构建」后再调 POST /templates 真正落盘。
+    样张可以反复上传，每次都会重新识别。
+    """
+    try:
+        store.load_category(cid)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+    fname = _clean_name(sample.filename or "sample")
+    with tempfile.TemporaryDirectory(prefix="drc-probe-") as td:
+        dst = Path(td) / fname
+        with dst.open("wb") as fh:
+            shutil.copyfileobj(sample.file, fh)
+        try:
+            info = service.probe_sample(dst, dpi_hint=int(dpi_hint))
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(400, f"样张无法解析：{exc}") from exc
+    info["filename"] = fname
+    return info
 
 
 @app.get("/api/categories/{cid}/templates")
@@ -182,8 +292,166 @@ def get_template(cid: str, tid: str) -> dict:
 
 @app.delete("/api/categories/{cid}/templates/{tid}")
 def delete_template(cid: str, tid: str) -> dict:
-    store.delete_template(cid, tid)
-    return {"ok": True, "id": tid}
+    cleanup = store.delete_template(cid, tid)
+    return {"ok": True, "id": tid, "cleanup": cleanup}
+
+
+_TPL_EDIT_LABEL = {
+    "name": "名称", "dpi": "DPI", "paper_mode": "纸张处理",
+    "corners": "四角", "ink_bias": "深墨偏置(建模板)",
+    "ink_dark_bias": "深墨偏置(输出)", "mono": "黑白输出", "deskew": "自动纠偏",
+}
+
+
+@app.post("/api/categories/{cid}/templates/{tid}/edit")
+@app.post("/api/categories/{cid}/templates/{tid}/rebuild")
+async def edit_template(
+    cid: str,
+    tid: str,
+    name: str | None = Form(None),
+    dpi: int | None = Form(None),
+    width: int | None = Form(None),
+    height: int | None = Form(None),
+    paper_mode: str | None = Form(None),
+    corners: str | None = Form(None),
+    ink_bias: int | None = Form(None),
+    ink_dark_bias: int | None = Form(None),
+    mono: bool | None = Form(None),
+    deskew: bool | None = Form(None),
+    force: bool = Form(False),
+    sample: UploadFile | None = File(None),
+) -> dict:
+    """**编辑模板**：改参数、换样张，然后按新参数重新渲染标准模板图。
+
+    所有字段都是**可选**的——只传要改的，没传的沿用原值，所以同一个接口
+    既能"只改个名字"（不重传样张，不重建）也能"换一张样张重新识别参数再建"。
+
+    `/rebuild` 是同一实现的别名（老入口，行为向后兼容）。
+
+    **坐标清单保留不动**——但它是在旧模板上量的，重建后内容可能整体转动或
+    缩放，所以返回值里会明确提示需要逐个核对。
+    """
+    try:
+        tpl = store.load_template(cid, tid)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+
+    before = {k: tpl.get(k) for k in _TPL_EDIT_LABEL}
+    before_canvas = dict(tpl.get("canvas") or {})
+
+    # ---- 1) 合并参数（只覆盖显式传上来的字段）----
+    if name is not None:
+        if not name.strip():
+            raise HTTPException(400, "模板名称不能为空")
+        tpl["name"] = name.strip()
+    if dpi is not None:
+        if dpi < 50 or dpi > 1200:
+            raise HTTPException(400, "DPI 需要在 50~1200 之间")
+        tpl["dpi"] = int(dpi)
+    if width is not None:
+        if not (100 <= width <= 20000):
+            raise HTTPException(400, "画布宽需要在 100~20000 像素之间")
+        tpl.setdefault("canvas", {})["width"] = int(width)
+    if height is not None:
+        if not (100 <= height <= 20000):
+            raise HTTPException(400, "画布高需要在 100~20000 像素之间")
+        tpl.setdefault("canvas", {})["height"] = int(height)
+    if paper_mode is not None:
+        if paper_mode not in ("off", "auto", "corners"):
+            raise HTTPException(400, "纸张处理只能是 off / auto / corners")
+        tpl["paper_mode"] = paper_mode
+    if corners is not None:
+        cs: list[float] | None = None
+        if corners.strip():
+            try:
+                cs = [float(v) for v in corners.replace("，", ",").split(",") if v.strip()]
+            except ValueError as exc:
+                raise HTTPException(400, "四角格式应为 x1,y1,x2,y2,x3,y3,x4,y4") from exc
+            if len(cs) != 8:
+                raise HTTPException(400, "四角需要 8 个数：x1,y1,x2,y2,x3,y3,x4,y4")
+        tpl["corners"] = cs
+    if ink_bias is not None:
+        tpl["ink_bias"] = int(ink_bias)
+    if ink_dark_bias is not None:
+        tpl["ink_dark_bias"] = int(ink_dark_bias)
+    if mono is not None:
+        tpl["mono"] = bool(mono)
+    if deskew is not None:
+        tpl["deskew"] = bool(deskew)
+
+    # ---- 2) 换样张（可选）----
+    changed: list[str] = []
+    src = store.sample_file(cid, tid)
+    sample_replaced = False
+    if sample is not None and sample.filename:
+        sdir = store.tpl_dir(cid, tid) / "sample"
+        sdir.mkdir(parents=True, exist_ok=True)
+        for old in sdir.iterdir():
+            if old.is_file():
+                old.unlink()
+        dst = sdir / _clean_name(sample.filename)
+        with dst.open("wb") as fh:
+            shutil.copyfileobj(sample.file, fh)
+        src = dst
+        sample_replaced = True
+    if src is None:
+        raise HTTPException(400, "该模板还没有样张，请上传一张")
+
+    tpl["sample"] = {"filename": src.name}
+
+    # ---- 3) 差异清单（给前端说人话）----
+    if sample_replaced:
+        changed.append(f"样张 → {src.name}")
+    for k, label in _TPL_EDIT_LABEL.items():
+        if tpl.get(k) != before[k]:
+            changed.append(f"{label}: {before[k]} → {tpl.get(k)}")
+    canvas_now = tpl.get("canvas") or {}
+    if canvas_now != before_canvas:
+        changed.append(
+            f"画布: {before_canvas.get('width')}×{before_canvas.get('height')}"
+            f" → {canvas_now.get('width')}×{canvas_now.get('height')}")
+
+    # 只改了名字这种"不影响渲染"的字段就不用重跑了，省几秒；
+    # force=true 可强制重跑（老 /rebuild 的语义：无论如何都重建一次）
+    needs_rebuild = force or sample_replaced or any(
+        k in ("dpi", "paper_mode", "corners", "ink_bias", "deskew")
+        for k in _TPL_EDIT_LABEL if tpl.get(k) != before[k]
+    ) or canvas_now != before_canvas
+
+    tpl["updated_at"] = store._now()
+    store.save_template(cid, tid, tpl)
+
+    if needs_rebuild:
+        try:
+            res = service.build_template(
+                cid, tid, src,
+                dpi=int(tpl.get("dpi", 200)),
+                canvas=(int(canvas_now.get("width", 1600)),
+                        int(canvas_now.get("height", 2600))),
+                paper_mode=tpl.get("paper_mode") or "off",
+                corners=tpl.get("corners"),
+                ink_bias=int(tpl.get("ink_bias") or 0),
+                deskew_sample=bool(tpl.get("deskew", True)))
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(400, f"模板重建失败：{exc}") from exc
+
+        tpl["sample"].update({k: res["info"][k] for k in
+                              ("sample_size", "sample_kind", "sample_mm")})
+        tpl["template"] = {"ready": True, **res["info"]}
+        tpl["warnings"] = res["warnings"]
+        store.save_template(cid, tid, tpl)
+
+    n_blocks = store._count_blocks(store.tpl_dir(cid, tid) / "crops.json")
+    out = store.load_template(cid, tid)
+    out["template_ready"] = (store.tpl_dir(cid, tid) / "template" / "template.png").exists()
+    out["n_blocks"] = n_blocks
+    out["changed"] = changed
+    out["rebuilt"] = needs_rebuild
+    if needs_rebuild and n_blocks:
+        out.setdefault("warnings", []).append(
+            f"保留了原有的 {n_blocks} 个坐标块——它们是在旧模板上量的。"
+            "本次重建可能让内容整体转动或缩放，请逐个核对预览图，偏了就重新框选。")
+    return out
 
 
 @app.get("/api/categories/{cid}/templates/{tid}/template")
@@ -258,10 +526,14 @@ def get_crops(cid: str, tid: str) -> dict:
 
 @app.post("/api/categories/{cid}/templates/{tid}/crops")
 def add_crop(cid: str, tid: str, payload: dict = Body(...)) -> dict:
-    item_id = str(payload.get("id", "")).strip()
+    """新增/更新一个模板块。
+
+    `id` 为空 = 新建（服务端自动分配 fieldNN）；非空 = 更新已有块。
+    `name` 是人工编辑的字段说明，可选。
+    """
+    item_id = str(payload.get("id", "") or "").strip()
+    name = str(payload.get("name", "") or "").strip()
     roi = payload.get("roi")
-    if not item_id:
-        raise HTTPException(400, "请填写字段名称（块 ID）")
     if not isinstance(roi, (list, tuple)) or len(roi) != 4:
         raise HTTPException(400, "roi 需要 4 个数：x,y,w,h")
     try:
@@ -271,9 +543,8 @@ def add_crop(cid: str, tid: str, payload: dict = Body(...)) -> dict:
     if roi_i[2] <= 0 or roi_i[3] <= 0:
         raise HTTPException(400, "roi 的宽高必须大于 0")
     try:
-        return service.add_crop(cid, tid, item_id, roi_i,
-                                int(payload.get("safe_margin", 0) or 0),
-                                str(payload.get("note", "") or ""))
+        return service.add_crop(cid, tid, item_id, name, roi_i,
+                                int(payload.get("safe_margin", 0) or 0))
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
 
@@ -371,8 +642,17 @@ async def create_job(cid: str, files: list[UploadFile] = File(...)) -> dict:
 
 
 @app.get("/api/jobs")
-def jobs(category_id: str | None = None, limit: int = 30) -> list[dict]:
-    return store.list_jobs(category_id, limit=limit)
+def jobs(category_id: str | None = None, template_id: str | None = None,
+         limit: int = 30) -> list[dict]:
+    """任务列表。
+
+    - 归属有**两级**：分类是任务级的，模板是**页级**的（一个任务可混多个模板），
+      所以列表里同时给出 `category_id/name` 与 `templates: [{id,name,n}]` 汇总，
+      不用点开详情就能反推出"这批是哪个分类、识别到了哪些模板"。
+    - `?template_id=TPLxxx` 可按模板反查任务（哪些任务用过这个模板）。
+    - 名称是建任务时的**快照**；稳定键是 id。
+    """
+    return store.list_jobs(category_id, limit=limit, template_id=template_id)
 
 
 @app.get("/api/jobs/{jid}")
@@ -381,6 +661,21 @@ def get_job(jid: str) -> dict:
         return store.load_job(jid)
     except FileNotFoundError as exc:
         raise HTTPException(404, str(exc)) from exc
+
+
+@app.delete("/api/jobs/{jid}")
+def delete_job(jid: str) -> dict:
+    """删除任务及其全部磁盘产物（标准图、裁剪块、拒收原图、验证报告）。
+
+    返回 cleanup：deleted=已真正删除；trashed=环境拦截了批量删除，
+    已整目录改名到 data/.trash（列表里已消失，磁盘清理可手动做）。
+    """
+    try:
+        store.load_job(jid)
+    except FileNotFoundError as exc:
+        raise HTTPException(404, str(exc)) from exc
+    cleanup = store.delete_job(jid)
+    return {"ok": True, "id": jid, "cleanup": cleanup}
 
 
 @app.post("/api/jobs/{jid}/verify")
@@ -395,8 +690,27 @@ def verify_job(jid: str, limit: int = 24, tol: float = 3.0) -> dict:
 
 # ---------------------------------------------------------------- 静态资源
 
-store._ensure()
-app.mount("/files", StaticFiles(directory=str(store.DATA)), name="files")
+
+@app.get("/files/{rel_path:path}")
+def data_file(rel_path: str) -> FileResponse:
+    """数据目录下的产物（模板图、标准输出图、裁剪块、验证报告）。
+
+    刻意**不用启动时绑定的 StaticFiles**：数据目录可以在前端随时切换，
+    静态挂载是启动时固定死的，切了目录之后图片会全部 404。
+    这里每次请求都按当前数据目录解析，并挡住路径穿越。
+    """
+    if not store.is_configured():
+        raise HTTPException(409, "尚未配置数据目录")
+    root = store.data_root().resolve()
+    target = (root / rel_path).resolve()
+    try:
+        target.relative_to(root)          # 路径穿越保护
+    except ValueError:
+        raise HTTPException(404, "not found") from None
+    if not target.is_file():
+        raise HTTPException(404, "not found")
+    return FileResponse(target)
+
 
 if store.WEB.is_dir():
     app.mount("/", StaticFiles(directory=str(store.WEB), html=True), name="web")

@@ -152,6 +152,10 @@ def _row_name(p: Path) -> str:
     报告里出现两行同名会让人无法判断到底哪张有问题。所以把所属的运行目录带上。
     """
     parent = p.parent
+    # 标准图在 standardized/image/ 下：归到 standardized/ 这个名字，
+    # 避免报告里出现 "image/xxx" 这种让人误解为另一类目录的行名
+    if parent.name == "image" and parent.parent.name == "standardized":
+        return f"standardized/{p.stem}"
     if parent.name in ("standardized", "low_confidence"):
         return f"{parent.parent.name}/{p.stem}"
     return f"{parent.name}/{p.stem}" if parent.name else p.stem

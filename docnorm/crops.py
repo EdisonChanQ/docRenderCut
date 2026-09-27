@@ -16,6 +16,7 @@
 from __future__ import annotations
 
 import json
+import re
 from dataclasses import asdict, dataclass, field
 from pathlib import Path
 
@@ -34,15 +35,20 @@ def _to_gray(img: np.ndarray) -> np.ndarray:
 
 @dataclass
 class CropItem:
-    id: str
-    roi: list[int]              # x, y, w, h —— 标准画布坐标
+    id: str                     # 自动分配：field01 / field02 …（机器标识，不人工编辑）
+    name: str = ""              # 字段说明：人工编辑，赋予 id 含义（如「付款账户」）
+    roi: list[int] = field(default_factory=list)   # x, y, w, h —— 标准画布坐标
     safe_margin: int = 0        # roi_safe = roi 外扩这么多像素（吸收有界配准残差）
-    note: str = ""
 
     def box(self, *, use_safe: bool = True) -> tuple[int, int, int, int]:
         x, y, w, h = (int(round(v)) for v in self.roi)
         m = int(self.safe_margin) if use_safe else 0
         return x - m, y - m, w + 2 * m, h + 2 * m
+
+    @property
+    def label(self) -> str:
+        """给人看的标签：优先字段说明，没填就退回 id。"""
+        return (self.name or "").strip() or self.id
 
 
 @dataclass
@@ -62,6 +68,29 @@ class CropSpec:
             if it.id == item_id:
                 return it
         return None
+
+    # ---- 字段 ID 分配 --------------------------------------------------------
+
+    @staticmethod
+    def _seq_of(item_id: str) -> int | None:
+        m = re.fullmatch(r"field(\d+)", item_id or "")
+        return int(m.group(1)) if m else None
+
+    def next_id(self) -> str:
+        """分配下一个字段 ID（fieldNN），并推进计数器。
+
+        计数器**持久化在 meta.next_field_seq**，而不是"现有最大号 + 1"：
+        后者在"删掉最大号再新建"时会复用已删除的 ID，
+        而下游（ERP）可能已按旧 ID 存了对应关系——复用会让新旧语义撞车。
+        所以这里是**单调递增、永不复用**。
+        """
+        n = int(self.meta.get("next_field_seq", 1) or 1)
+        for it in self.items:
+            s = self._seq_of(it.id)
+            if s is not None:
+                n = max(n, s + 1)
+        self.meta["next_field_seq"] = n + 1
+        return f"field{n:02d}"
 
     def upsert(self, item: CropItem) -> None:
         for i, it in enumerate(self.items):
@@ -92,9 +121,10 @@ class CropSpec:
         items = [
             CropItem(
                 id=str(it["id"]),
+                # 兼容旧数据：老版本用 note 存字段名，读到就并入 name
+                name=str(it.get("name") or it.get("note") or ""),
                 roi=[int(round(float(v))) for v in it["roi"]],
                 safe_margin=int(it.get("safe_margin", 0) or 0),
-                note=str(it.get("note", "") or ""),
             )
             for it in d.get("items", [])
         ]
@@ -142,7 +172,7 @@ class CropSpec:
             x, y, bw, bh = it.box(use_safe=True)
             if x < 0 or y < 0 or x + bw > w or y + bh > h:
                 problems.append(
-                    f"块 {it.id} 的裁剪框 [{x},{y},{bw},{bh}] 超出画布 {w}x{h}（会被截断）")
+                    f"块 {it.label} 的裁剪框 [{x},{y},{bw},{bh}] 超出画布 {w}x{h}（会被截断）")
         return problems
 
 

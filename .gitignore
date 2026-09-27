@@ -13,6 +13,10 @@ data_backup_*/
 drift_*.png
 *.tmp
 
+# local scratch (one-off scripts / test screenshots / intermediate files)
+# convention: scratch artifacts start with "_" so they never get committed
+_*
+
 # IDE / OS
 .idea/
 .vscode/

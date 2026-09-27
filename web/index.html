@@ -10,8 +10,18 @@
 <body>
 
 <header class="topbar">
-  <div class="brand">docRenderCut<small>单据标准模板渲染与模板块裁剪</small></div>
+  <!-- 品牌字样不放顶栏：浏览器标签页已带产品名，这里把空间留给分类信息与操作 -->
+  <div id="catBar" class="cat-bar" hidden>
+    <h2 id="catName" class="cat-title">—</h2>
+    <span class="cat-meta" id="catMeta"></span>
+    <button id="btnNewTpl" class="ghost sm">+ 新建模板</button>
+    <button id="btnEditTpl" class="ghost sm" disabled>编辑模板</button>
+    <button id="btnDelTpl" class="danger ghost sm" disabled>删除模板</button>
+    <button id="btnDelCat" class="danger ghost sm">删除分类</button>
+  </div>
+
   <div class="grow"></div>
+  <button id="btnDataDir" class="ghost sm" hidden>数据目录</button>
   <span id="health" class="chip">检查服务…</span>
 </header>
 
@@ -35,16 +45,6 @@
     </div>
 
     <div id="catView" class="cat-view" hidden>
-      <div class="cat-head">
-        <div>
-          <h2 id="catName">—</h2>
-          <div class="cat-meta" id="catMeta"></div>
-        </div>
-        <div class="grow"></div>
-        <button id="btnNewTpl" class="ghost">+ 新建模板</button>
-        <button id="btnDelCat" class="danger ghost">删除分类</button>
-      </div>
-
       <div id="catWarn" class="warn" hidden></div>
 
       <!-- 模板选择条：分类下的模板列表 -->
@@ -65,14 +65,17 @@
           <div class="pane-left">
             <div class="toolbar">
               <span class="lbl">缩放</span>
-              <input id="zoom" type="range" min="0.1" max="3" step="0.05" value="0.4">
+              <input id="zoom" type="range" min="0.1" max="8" step="0.05" value="0.4">
               <span id="zoomVal" class="mono">0.40x</span>
               <button id="btnFit" class="ghost sm">适应宽度</button>
+              <button id="btnZoom1" class="ghost sm">1:1</button>
               <label class="ck"><input id="ckLines" type="checkbox"> 显示检测到的表格线</label>
               <label class="ck"><input id="ckSnap" type="checkbox" checked> 吸附表格线</label>
               <label class="ck" title="默认只显示选中的那个框；勾上可一次看全部">
                 <input id="ckShowAll" type="checkbox"> 全部显示</label>
               <a id="linkFullTpl" class="btn-like sm" target="_blank" hidden>看原图</a>
+              <span class="grow"></span>
+              <span id="cursorPos" class="mono sm dim">—</span>
             </div>
             <div class="canvas-wrap" id="canvasWrap">
               <canvas id="tplCanvas"></canvas>
@@ -80,7 +83,8 @@
             <div class="hint">
               在模板图上<b>拖出一个新框</b>；点击右下列表里的某一项即<b>选中并显示它的框</b>（默认不显示全部框，
               需要时勾选工具栏「全部显示」）。选中后：拖框内部<b>移动坐标</b>，拖框边上的 8 个方块<b>改宽高</b>，
-              方向键 ±1px、Shift+方向键 ±10px 微调。右侧数字与框是双向联动的。
+              方向键 ±1px、Shift+方向键 ±10px 微调，右侧数字与框双向联动。
+              <b>放大到 1x 以上时，按住空格拖动（或中键拖动/滚轮）可平移查看</b>，把某个细节放到最大再放框最准。
               <span id="tplSizeHint" class="dim"></span>
             </div>
           </div>
@@ -88,8 +92,10 @@
           <div class="pane-right">
             <h3>模板块坐标</h3>
             <div class="form">
-              <label>字段名称 <span class="req">*</span>
-                <input id="inId" placeholder="如 amount_fig / 小写金额"></label>
+              <label>字段 ID <span class="dim">（保存后自动分配，不可编辑）</span>
+                <input id="inId" readonly placeholder="自动分配 fieldNN"></label>
+              <label>字段说明 <span class="req">*</span>
+                <input id="inName" placeholder="如 付款账户 / 开票日期"></label>
               <div class="row4">
                 <label>X<input id="inX" type="number" step="1"></label>
                 <label>Y<input id="inY" type="number" step="1"></label>
@@ -98,7 +104,6 @@
               </div>
               <label>外扩像素 <span class="dim">（吸收配准残差，实际裁剪框 = 上面坐标外扩这么多）</span>
                 <input id="inMargin" type="number" step="1" value="8"></label>
-              <label>备注<input id="inNote" placeholder="可选"></label>
               <div class="btn-row">
                 <button id="btnAddCrop" class="primary">保存该块</button>
                 <button id="btnClearSel" class="ghost">取消选择</button>
@@ -125,19 +130,30 @@
           <input id="batchFiles" type="file" multiple accept=".pdf,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp">
           <div class="btn-row">
             <button id="btnRunBatch" class="primary">上传并处理</button>
-            <button id="btnVerify" class="ghost" disabled>运行块验证</button>
           </div>
           <div id="progressWrap" class="progress-wrap" hidden>
             <div class="progress"><div id="progressBar"></div></div>
             <div id="progressText" class="dim"></div>
           </div>
         </div>
-        <div id="jobResult"></div>
+        <div class="card">
+          <h3>任务记录</h3>
+          <p class="dim sm">这里显示该分类最近的任务（不过滤）。点任意一条可打开弹窗查看逐页卡片与裁切块。</p>
+          <div id="batchJobList" class="jobs-list"></div>
+        </div>
       </section>
 
       <!-- ============ 任务记录 ============ -->
       <section class="tabpane" data-pane="jobs">
         <p id="jobsScope" class="scope"></p>
+        <div class="filter-bar">
+          <span class="lbl">筛选：</span>
+          <button class="fbtn on" data-f="all">全部</button>
+          <button class="fbtn" data-f="ok">合格</button>
+          <button class="fbtn" data-f="low_confidence">低置信</button>
+          <button class="fbtn" data-f="rejected">拒收</button>
+          <span class="dim sm" id="filterHint"></span>
+        </div>
         <div id="jobsList" class="jobs-list"></div>
       </section>
     </div>
@@ -168,14 +184,20 @@
 <div id="modalTpl" class="modal" hidden>
   <div class="modal-box">
     <div class="modal-head">
-      <h3>创建模板</h3>
+      <h3 id="tplModalTitle">创建模板</h3>
       <button class="x" data-close>×</button>
     </div>
     <div class="modal-body" id="tplBody">
       <label>模板名称 <span class="req">*</span>
         <input id="tfName" placeholder="如 汇丰A版 / 恒生B版"></label>
-      <p class="dim sm">模板 ID 由后台自动生成（形如 TPL20260925-0001）。</p>
+      <p class="dim sm" id="tfIdHint">模板 ID 由后台自动生成（形如 TPL20260925-0001）。</p>
 
+      <label>① 样张（单页：矢量 PDF / 扫描件 / 图片）
+        <input id="tfSample" type="file" accept=".pdf,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp"></label>
+      <div id="tfCurSample" class="cur-sample" hidden></div>
+      <div id="tfProbe" class="probe" hidden></div>
+
+      <label class="step2">② 核对参数（上传后已按样张自动填充，可改）</label>
       <div class="grid3">
         <label>DPI<input id="tfDpi" type="number" value="200" min="50" max="1200"></label>
         <label>画布宽 W<input id="tfW" type="number" value="1600"></label>
@@ -183,11 +205,10 @@
       </div>
       <p class="dim sm" id="tfSizeHint">画布 = 宽×高 像素 @ DPI。上传样张后会核对宽高比。</p>
 
-      <label>样张（单页：矢量 PDF / 扫描件 / 图片）
-        <input id="tfSample" type="file" accept=".pdf,.png,.jpg,.jpeg,.bmp,.tif,.tiff,.webp"></label>
-
       <details class="adv">
         <summary>高级选项（拍照件、有底纹的票据需要）</summary>
+        <label class="ck" title="先把样例摆正再建模板，否则整个模板基准会带着倾斜">
+          <input id="tfDeskew" type="checkbox" checked> 建模板时自动纠偏（推荐）</label>
         <label>纸张处理
           <select id="tfPaper">
             <option value="off">整页样张（扫描件 / 矢量 PDF，推荐）</option>
@@ -207,9 +228,59 @@
     </div>
     <div class="modal-foot" id="tplFoot">
       <button class="ghost" data-close>取消</button>
-      <button id="btnDoCreateTpl" class="primary">上传并构建模板</button>
+      <button id="btnDoCreateTpl" class="primary">确认构建模板</button>
       <button id="btnPreviewTpl" class="primary" hidden>模板预览</button>
       <button id="btnFinishTpl" class="primary" hidden>关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 任务详情弹窗（逐页卡片 + 裁切块） ============ -->
+<div id="jobModal" class="modal" hidden>
+  <div class="modal-box wide">
+    <div class="modal-head">
+      <h3 id="jmTitle">任务详情</h3>
+      <button class="x" data-close>×</button>
+    </div>
+    <div class="modal-body" id="jmBody"></div>
+    <div class="modal-foot">
+      <button id="jmVerify" class="ghost">运行块验证</button>
+      <button id="jmDelete" class="danger ghost">删除任务</button>
+      <button class="primary" data-close>关闭</button>
+    </div>
+  </div>
+</div>
+
+<!-- ============ 数据目录配置 / 初始化 ============ -->
+<div id="setupModal" class="modal" hidden>
+  <div class="modal-box">
+    <div class="modal-head">
+      <h3 id="setupTitle">初始化 · 配置数据目录</h3>
+      <button class="x" data-close id="setupX" hidden>×</button>
+    </div>
+    <div class="modal-body">
+      <p id="setupIntro" class="dim sm">
+        本项目的数据与代码分离：分类、模板、任务都写在**数据目录**里，不放在项目目录下。
+        请先指定数据目录并完成校验，之后才能创建分类与模板。
+      </p>
+
+      <div id="setupCurrent" class="setup-current" hidden></div>
+
+      <label>数据目录 <span class="req">*</span>
+        <input id="setupPath" placeholder="如 D:\docRenderCut-data 或 \\fileserver\share\drc"></label>
+      <p class="dim sm">必须填**绝对路径**；目录不存在会自动创建。校验只写一个随即删除的探测文件，不影响目录里已有数据。</p>
+
+      <div class="btn-row" style="margin-bottom:10px">
+        <button id="btnProbeDir" class="primary">① 探测校验</button>
+      </div>
+
+      <div id="setupReport" class="setup-report" hidden></div>
+      <div id="setupMsg" class="msg" hidden></div>
+      <div id="setupLock" class="warn" hidden></div>
+    </div>
+    <div class="modal-foot">
+      <button class="ghost" data-close id="setupCancel" hidden>取消</button>
+      <button id="btnApplyDir" class="primary" disabled>② 确认并启用</button>
     </div>
   </div>
 </div>

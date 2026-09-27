@@ -61,53 +61,60 @@ def load_image(path: Path) -> tuple[np.ndarray, float | None]:
 
 
 def load_pdf(path: Path, render_dpi: int) -> list[tuple[np.ndarray, float]]:
-    """把 PDF 每页栅格化成 BGR。"""
+    """把 PDF 每页栅格化成 BGR。
 
+    注意：**整本 PDF 一次性解码**。批量处理请用 `iter_batch_stream`，
+    它逐页 yield、内存与页数无关（大批次下这是 OOM 与否的分界）。
+    """
+    return list(iter_pdf_pages(path, render_dpi))
+
+
+def iter_pdf_pages(path: Path, render_dpi: int):
+    """**逐页**栅格化 PDF（生成器）。
+
+    与 load_pdf 的区别只在内存：这里每 yield 一页就释放上一页的位图，
+    峰值 ≈ 1 页（叠加上调用方持有的页）。50 页的批次从"一次 1.2 GB"
+    降到"任意时刻几十 MB"。
+    """
     import pymupdf
 
-    out: list[tuple[np.ndarray, float]] = []
     doc = pymupdf.open(str(path))
     try:
         for page in doc:
             pm = page.get_pixmap(dpi=int(render_dpi))
-            arr = np.frombuffer(pm.samples, dtype=np.uint8).reshape(pm.height, pm.width, pm.n)
-            if pm.n == 4:
-                arr = cv2.cvtColor(arr, cv2.COLOR_RGBA2BGR)
-            elif pm.n == 3:
-                arr = cv2.cvtColor(arr, cv2.COLOR_RGB2BGR)
+            n = pm.n
+            buf = np.frombuffer(pm.samples, dtype=np.uint8).reshape(pm.height, pm.width, n)
+            if n == 4:
+                img = cv2.cvtColor(buf, cv2.COLOR_RGBA2BGR)
+            elif n == 3:
+                img = cv2.cvtColor(buf, cv2.COLOR_RGB2BGR)
             else:
-                arr = cv2.cvtColor(arr, cv2.COLOR_GRAY2BGR)
-            out.append((np.ascontiguousarray(arr), float(render_dpi)))
+                img = cv2.cvtColor(buf, cv2.COLOR_GRAY2BGR)
+            out = np.ascontiguousarray(img)
+            # 显式断开对 pixmap 缓冲区的引用，让这一页的位图尽早被回收
+            pm = None
+            buf = None
+            yield out, float(render_dpi)
     finally:
         doc.close()
-    return out
 
 
-def iter_units(path: str | Path, *, render_dpi: int = 300) -> list[PageUnit]:
-    """把一个文件（图片或 PDF）展开成页面单元列表。"""
-    path = Path(path)
-    if not path.exists():
-        raise FileNotFoundError(path)
-
-    ext = path.suffix.lower()
+def count_pages(path: str | Path) -> int:
+    """只数页数、不栅格化（用于给任务一个准确的总页数，成本极低）。"""
+    p = Path(path)
+    ext = p.suffix.lower()
     if ext in PDF_EXT:
-        pages = load_pdf(path, render_dpi)
-        n = len(pages)
-        return [
-            PageUnit(path, i, img, page_count=n, declared_dpi=dpi,
-                     meta={"render_dpi": render_dpi})
-            for i, (img, dpi) in enumerate(pages)
-        ]
+        import pymupdf
 
+        with pymupdf.open(str(p)) as doc:
+            return doc.page_count
     if ext in IMAGE_EXT:
-        img, dpi = load_image(path)
-        return [PageUnit(path, 0, img, page_count=1, declared_dpi=dpi)]
-
-    raise ValueError(f"不支持的文件类型: {path.suffix}")
+        return 1
+    raise ValueError(f"不支持的文件类型: {p.suffix}")
 
 
-def iter_batch(paths: list[str | Path], *, render_dpi: int = 300) -> list[PageUnit]:
-    """展开一批文件（目录会自动展开为其中的图片/PDF）。"""
+def expand_files(paths: list[str | Path]) -> list[Path]:
+    """目录自动展开为其中的图片/PDF；顺序稳定（便于结果可复现）。"""
     files: list[Path] = []
     for p in paths:
         p = Path(p)
@@ -118,8 +125,49 @@ def iter_batch(paths: list[str | Path], *, render_dpi: int = 300) -> list[PageUn
             ))
         else:
             files.append(p)
+    return files
 
-    units: list[PageUnit] = []
-    for f in files:
-        units.extend(iter_units(f, render_dpi=render_dpi))
-    return units
+
+def iter_units(path: str | Path, *, render_dpi: int = 300) -> list[PageUnit]:
+    """把一个文件（图片或 PDF）展开成页面单元列表。
+
+    注意：**一次性**返回全部页（PDF 会整本解码）。批量处理请用
+    `iter_batch_stream`。
+    """
+    return list(iter_units_stream(path, render_dpi=render_dpi))
+
+
+def iter_units_stream(path: str | Path, *, render_dpi: int = 300):
+    """逐页产出页面单元（生成器），一次只驻留一页。"""
+    path = Path(path)
+    if not path.exists():
+        raise FileNotFoundError(path)
+
+    ext = path.suffix.lower()
+    if ext in PDF_EXT:
+        n = count_pages(path)
+        for i, (img, dpi) in enumerate(iter_pdf_pages(path, render_dpi)):
+            yield PageUnit(path, i, img, page_count=n, declared_dpi=dpi,
+                           meta={"render_dpi": render_dpi})
+
+    elif ext in IMAGE_EXT:
+        img, dpi = load_image(path)
+        yield PageUnit(path, 0, img, page_count=1, declared_dpi=dpi)
+
+    else:
+        raise ValueError(f"不支持的文件类型: {path.suffix}")
+
+
+def iter_batch(paths: list[str | Path], *, render_dpi: int = 300) -> list[PageUnit]:
+    """展开一批文件（目录会自动展开为其中的图片/PDF）。
+
+    注意：**一次性**返回全部页，内存与总页数成正比（300dpi A4 约 25 MB/页）。
+    服务端的批量任务请用 `iter_batch_stream` + 有界在飞数，避免大批次 OOM。
+    """
+    return list(iter_batch_stream(paths, render_dpi=render_dpi))
+
+
+def iter_batch_stream(paths: list[str | Path], *, render_dpi: int = 300):
+    """逐页产出整批文件的页面单元（生成器）。内存与总页数无关。"""
+    for f in expand_files(paths):
+        yield from iter_units_stream(f, render_dpi=render_dpi)
